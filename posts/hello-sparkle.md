@@ -1,4 +1,5 @@
 # Haskell meets large scale distributed analytics
+>? large scale distribution of haskell using Spark
 
 Large scale distributed applications are complex: there are effects at
 scale that matter far more than when your application is basked in the
@@ -14,8 +15,10 @@ application patterns, and solve coping with these effects once and for
 all for each such pattern, so that applications writers don't have to
 do so themselves from scratch every time. Today we're introducing an
 early release of Sparkle. The motto: implement a robust and scalable
+>? s/release/tech preview/
 distributed computing middleware for Haskell, by reusing Spark.
 
+>? Before discussing 'why spark' I need to know what it is. Am I supposed to know that already?
 Why Spark? We could as well have built a complete platform starting
 from the likes of Cloud Haskell, which we maintain. And distributed
 computing engines is increasingly becoming a crowded space. We started
@@ -24,6 +27,7 @@ a model with state-of-the-art machine learning techniques, what is my
 best option to get the job done? How can I do that without giving up
 Haskell's strong static guarantees and concise syntax?
 
+>? Say what it is more consisely (eg. 'an engine to distribute computation on a cluster') first.
 Spark is a popular piece of the puzzle that leverages the huge Hadoop
 ecosystem for storage and cluster resource management to make it easy
 to write robust and scalable distributed applications as the
@@ -40,7 +44,7 @@ the kind of intricately complex algorithms common in analytics, **so
 we're throwing it into the mix**.
 
 ## Spark basics
-
+>? I don't care about scala. Show me haskell right away.
 Let's start with a trivial "Hello World" Spark application in Scala:
 
 ```scala
@@ -89,6 +93,7 @@ Spark applications in Haskell (release early, release often!).
 
 ## My first Spark app in Haskell
 
+>? What does this do? Motivate me to read the code instead of skipping/skimming..
 Here goes:
 
 ```haskell
@@ -130,6 +135,9 @@ over the dataset on one or more remote nodes in the cluster. But if
 cluster? Does Sparkle somehow know how to serialize closures into
 a sequence of bytes, hand it to Spark, and tell Spark how to
 deserialize this closure on the other end of the wire?
+
+>? I don's really care about implementation details *yet*. 
+>? What will I get? I'm just skipping over the technicalities because I want to get to what the promise is. So far it's unclear to me.
 
 That's where the `-XStaticPointers`
 [extension][extension-static-pointers] comes in. If you haven't heard
@@ -182,6 +190,8 @@ collection of documents before it can give us a model. For the
 curious, this variation is described in
 [this paper](https://www.cs.princeton.edu/~blei/papers/HoffmanBleiBach2010b.pdf).
 
+>?  lacking comments and/or division of the code into sub-procedures.
+>? What are the library functions? what do they do? The names are not descriptive enough to guess.
 ```haskell
 module SparkLDA where
 
