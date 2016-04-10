@@ -1,66 +1,36 @@
+-- | Foreign exports and instances to deal with 'Closure' in Spark.
+
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StaticPointers #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE UndecidableInstances #-} -- For Closure instances
 
-module Control.Distributed.Spark.Closure where
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
+module Control.Distributed.Spark.Closure
+  ( JFun1
+  , JFun2
+  , apply
+  ) where
 
 import Control.Distributed.Closure
 import Control.Distributed.Closure.TH
-import Control.Applicative ((<|>))
-import Control.Monad ((<=<), forM, forM_)
 import Data.Binary (encode, decode)
-import Data.Int
-import Data.Maybe (fromJust)
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LBS
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Unsafe as BS
-import qualified Data.Text.Foreign as Text
-import Data.Text (Text)
-import Data.Typeable (Typeable, (:~:)(..), eqT, typeOf)
-import qualified Data.Vector.Storable as Vector
-import Data.Vector.Storable (Vector)
-import qualified Data.Vector.Storable.Mutable as MVector
-import Data.Vector.Storable.Mutable (IOVector)
-import Foreign (FunPtr, Ptr, Storable, newForeignPtr, withForeignPtr)
-import Foreign.Java
+import Data.ByteString (ByteString)
+import Data.Typeable (Typeable)
+import Foreign.JNI
+import Language.Java
 
-data Type a
-  = Fun [Type a] (Type a) -- ^ Pure function
-  | Act [Type a] (Type a) -- ^ IO action
-  | Proc [Type a]         -- ^ Procedure (i.e void returning action)
-  | Base a                -- ^ Any first-order type.
-
-type family Uncurry a where
-  Uncurry (Closure (a -> b -> c -> d -> IO ())) = 'Proc '[Uncurry a, Uncurry b, Uncurry c, Uncurry d]
-  Uncurry (Closure (a -> b -> c -> IO ())) = 'Proc '[Uncurry a, Uncurry b, Uncurry c]
-  Uncurry (Closure (a -> b -> IO ())) = 'Proc '[Uncurry a, Uncurry b]
-  Uncurry (Closure (a -> IO ())) = 'Proc '[Uncurry a]
-  Uncurry (IO ()) = 'Proc '[]
-  Uncurry (Closure (a -> b -> c -> d -> IO e)) = 'Act '[Uncurry a, Uncurry b, Uncurry c, Uncurry d] (Uncurry e)
-  Uncurry (Closure (a -> b -> c -> IO d)) = 'Act '[Uncurry a, Uncurry b, Uncurry c] (Uncurry d)
-  Uncurry (Closure (a -> b -> IO c)) = 'Act '[Uncurry a, Uncurry b] (Uncurry c)
-  Uncurry (Closure (a -> IO b)) = 'Act '[Uncurry a] (Uncurry b)
-  Uncurry (Closure (IO a)) = 'Act '[] (Uncurry a)
-  Uncurry (Closure (a -> b -> c -> d -> e)) = 'Fun '[Uncurry a, Uncurry b, Uncurry c, Uncurry d] (Uncurry e)
-  Uncurry (Closure (a -> b -> c -> d)) = 'Fun '[Uncurry a, Uncurry b, Uncurry c] (Uncurry d)
-  Uncurry (Closure (a -> b -> c)) = 'Fun '[Uncurry a, Uncurry b] (Uncurry c)
-  Uncurry (Closure (a -> b)) = 'Fun '[Uncurry a] (Uncurry b)
-  Uncurry a = 'Base a
-
-class (Uncurry a ~ b, Typeable a, Typeable b) => Reify a b where
-  reify :: JObject -> IO a
-
-class (Uncurry a ~ b, Typeable a, Typeable b) => Reflect a b where
-  reflect :: a -> IO JObject
-
+-- | The main entry point for Java code to apply a Haskell 'Closure'. This
+-- function is foreign exported.
 apply
   :: JByteArray
   -> JObjectArray
@@ -75,195 +45,130 @@ foreign export ccall "sparkle_apply" apply
   -> JObjectArray
   -> IO JObject
 
--- XXX GHC wouldn't be able to use the more natural
---
--- (Uncurry a ~ a', Uncurry b ~ b')
---
--- constraint, because it doesn't know that Uncurry is injective.
-instance (Uncurry (Closure (a -> b)) ~ 'Fun '[a'] b', Reflect a a', Reify b b') =>
-         Reify (Closure (a -> b)) ('Fun '[a'] b') where
-  reify jobj = do
-      klass <- findClass "io/tweag/sparkle/function/HaskellFunction"
-      field <- getFieldID klass "clos" "[B"
-      jpayload <- getObjectField jobj field
-      payload <- reify jpayload
-      return (bs2clos payload)
+type JFun1 a b = 'Class "io.tweag.sparkle.function.HaskellFunction" <> [a, b]
+type instance Interp ('Fun '[a] b) = JFun1 (Interp a) (Interp b)
 
-instance (Uncurry (Closure (a -> b)) ~ 'Fun '[a'] b', Reify a a', Reflect b b') =>
-         Reflect (Closure (a -> b)) ('Fun '[a'] b') where
-  reflect f = do
-      klass <- findClass "io/tweag/sparkle/function/HaskellFunction"
-      jpayload <- reflect (clos2bs (fromJust wrap))
-      newObject klass "([B)V" [JObject jpayload]
-    where
-      -- TODO this type dispatch is a gross temporary hack! For until we get the
-      -- instance commented out below to work.
-      wrap :: Maybe (Closure (JObjectArray -> IO JObject))
-      wrap =
-        fmap (\Refl -> $(cstatic 'closFun1) `cap` $(cstatic 'dict1) `cap` f) (eqT :: Maybe ((a, b) :~: (Int, Int))) <|>
-        fmap (\Refl -> $(cstatic 'closFun1) `cap` $(cstatic 'dict2) `cap` f) (eqT :: Maybe ((a, b) :~: (Bool, Bool))) <|>
-        fmap (\Refl -> $(cstatic 'closFun1) `cap` $(cstatic 'dict3) `cap` f) (eqT :: Maybe ((a, b) :~: (ByteString, ByteString))) <|>
-        fmap (\Refl -> $(cstatic 'closFun1) `cap` $(cstatic 'dict4) `cap` f) (eqT :: Maybe ((a, b) :~: (Text, Text))) <|>
-        fmap (\Refl -> $(cstatic 'closFun1) `cap` $(cstatic 'dict5) `cap` f) (eqT :: Maybe ((a, b) :~: (Text, Bool))) <|>
-        error ("Due to TEMPORARY HACK - No static function from " ++
-               show (typeOf (undefined :: a)) ++
-               " to " ++
-               show (typeOf (undefined :: b)))
+pairDict :: Dict c1 -> Dict c2 -> Dict (c1, c2)
+pairDict Dict Dict = Dict
 
--- Floating to top-level due to a limitation of -XStaticPointers.
---
--- TODO file bug report.
-
-dict1 :: Dict (Reify Int ('Base Int), Reflect Int ('Base Int))
-dict2 :: Dict (Reify Bool ('Base Bool), Reflect Bool ('Base Bool))
-dict3 :: Dict (Reify ByteString ('Base ByteString), Reflect ByteString ('Base ByteString))
-dict4 :: Dict (Reify Text ('Base Text), Reflect Text ('Base Text))
-dict5 :: Dict (Reify Text ('Base Text), Reflect Bool ('Base Bool))
-dict1 = Dict
-dict2 = Dict
-dict3 = Dict
-dict4 = Dict
-dict5 = Dict
-
-closFun1 :: Dict (Reify a a', Reflect b b') -> (a -> b) -> JObjectArray -> IO JObject
+closFun1
+  :: forall a b ty1 ty2.
+     Dict (Reify a ty1, Reflect b ty2)
+  -> (a -> b)
+  -> JObjectArray
+  -> IO JObject
 closFun1 Dict f args =
-    reflect =<< return . f =<< reify =<< getObjectArrayElement args 0
+    fmap upcast . refl =<< return . f =<< reif . unsafeCast =<< getObjectArrayElement args 0
+  where
+    reif = reify :: J ty1 -> IO a
+    refl = reflect :: b -> IO (J ty2)
 
--- instance (Uncurry (Closure (a -> b)) ~ Fun '[a'] b', Reflect a a', Reify b b') =>
---          Reify (Closure (a -> b)) (Fun '[a'] b') where
---   reify jobj = do
---       klass <- findClass "io/tweag/sparkle/function/Function"
---       field <- getFieldID klass "clos" "[B"
---       jpayload <- getObjectField jobj field
---       payload <- reify jpayload
---       return (bs2clos payload)
---   reifyDict =
---       cmapDict `cap` reifyDictFun1 `cap` (cpairDict `cap` reflectDict `cap` reifyDict)
---
--- reifyDictFun1 :: (Reflect a a', Reify b b') :- Reify (Closure (a -> b)) (Fun '[a'] b')
--- reifyDictFun1 = Sub
+type JFun2 a b c = 'Class "io.tweag.sparkle.function.HaskellFunction2" <> [a, b, c]
+type instance Interp ('Fun '[a, b] c) = JFun2 (Interp a) (Interp b) (Interp c)
 
-instance Reify ByteString ('Base ByteString) where
-  reify jobj = do
-      n <- getArrayLength jobj
-      bytes <- getByteArrayElements jobj
-      -- TODO could use unsafePackCStringLen instead and avoid a copy if we knew
-      -- that been handed an (immutable) copy via JNI isCopy ref.
-      bs <- BS.packCStringLen (bytes, fromIntegral n)
-      releaseByteArrayElements jobj bytes
-      return bs
+tripleDict :: Dict c1 -> Dict c2 -> Dict c3 -> Dict (c1, c2, c3)
+tripleDict Dict Dict Dict = Dict
 
-instance Reflect ByteString ('Base ByteString) where
-  reflect bs = BS.unsafeUseAsCStringLen bs $ \(content, n) -> do
-      arr <- newByteArray (fromIntegral n)
-      setByteArrayRegion arr 0 (fromIntegral n) content
-      return arr
-
-instance Reify Bool ('Base Bool) where
-  reify jobj = do
-      klass <- findClass "java/lang/Boolean"
-      method <- getMethodID klass "booleanValue" "()Z"
-      toEnum . fromIntegral <$> callBooleanMethod jobj method []
-
-instance Reflect Bool ('Base Bool) where
-  reflect x = do
-      klass <- findClass "java/lang/Boolean"
-      newObject klass "(Z)V" [JBoolean (fromIntegral (fromEnum x))]
-
-instance Reify Int ('Base Int) where
-  reify jobj = do
-      klass <- findClass "java/lang/Integer"
-      method <- getMethodID klass "longValue" "()L"
-      fromIntegral <$> callLongMethod jobj method []
-
-instance Reflect Int ('Base Int) where
-  reflect x = do
-      klass <- findClass "java/lang/Integer"
-      newObject klass "(L)V" [JInt (fromIntegral x)]
-
-instance Reify Double ('Base Double) where
-  reify jobj = do
-      klass <- findClass "java/lang/Double"
-      method <- getMethodID klass "doubleValue" "()D"
-      callDoubleMethod jobj method []
-
-instance Reflect Double ('Base Double) where
-  reflect x = do
-      klass <- findClass "java/lang/Double"
-      newObject klass "(D)V" [JDouble x]
-
-instance Reify Text ('Base Text) where
-  reify jobj = do
-      sz <- getStringLength jobj
-      cs <- getStringChars jobj
-      txt <- Text.fromPtr cs (fromIntegral sz)
-      releaseStringChars jobj cs
-      return txt
-
-instance Reflect Text ('Base Text) where
-  reflect x =
-      Text.useAsPtr x $ \ptr len ->
-        newString ptr (fromIntegral len)
-
-instance Reify (IOVector Int32) ('Base (IOVector Int32)) where
-  reify = reifyMVector (getIntArrayElements) (releaseIntArrayElements)
-
-instance Reflect (IOVector Int32) ('Base (IOVector Int32)) where
-  reflect = reflectMVector (newIntArray) (setIntArrayRegion)
-
-instance Reify (Vector Int32) ('Base (Vector Int32)) where
-  reify = Vector.freeze <=< reify
-
-instance Reflect (Vector Int32) ('Base (Vector Int32)) where
-  reflect = reflect <=< Vector.thaw
-
-instance Reify a (Uncurry a) => Reify [a] ('Base [a]) where
-  reify jobj = do
-      n <- getArrayLength jobj
-      forM [0..n-1] $ \i -> do
-        x <- getObjectArrayElement jobj i
-        reify x
-
-instance Reflect a (Uncurry a) => Reflect [a] ('Base [a]) where
-  reflect xs = do
-    let n = fromIntegral (length xs)
-    klass <- findClass "java/lang/Object"
-    array <- newObjectArray n klass
-    forM_ (zip [0..n-1] xs) $ \(i, x) -> do
-      setObjectArrayElement array i =<< reflect x
-    return array
-
-foreign import ccall "wrapper" wrapFinalizer
-  :: (Ptr a -> IO ())
-  -> IO (FunPtr (Ptr a -> IO ()))
-
-reifyMVector
-  :: Storable a
-  => (JArray -> IO (Ptr a))
-  -> (JArray -> Ptr a -> IO ())
-  -> JArray
-  -> IO (IOVector a)
-reifyMVector mk finalize jobj = do
-    n <- getArrayLength jobj
-    ptr <- mk jobj
-    ffinalize <- wrapFinalizer (finalize jobj)
-    fptr <- newForeignPtr ffinalize ptr
-    return (MVector.unsafeFromForeignPtr0 fptr (fromIntegral n))
-
-reflectMVector
-  :: Storable a
-  => (Int32 -> IO JArray)
-  -> (JArray -> Int32 -> Int32 -> Ptr a -> IO ())
-  -> IOVector a
-  -> IO JArray
-reflectMVector new fill mv = do
-    let (fptr, n) = MVector.unsafeToForeignPtr0 mv
-    jobj <- new (fromIntegral n)
-    withForeignPtr fptr $ fill jobj 0 (fromIntegral n)
-    return jobj
+closFun2
+  :: forall a b c ty1 ty2 ty3.
+     Dict (Reify a ty1, Reify b ty2, Reflect c ty3)
+  -> (a -> b -> c)
+  -> JObjectArray
+  -> IO JObject
+closFun2 Dict f args = do
+    a <- unsafeCast <$> getObjectArrayElement args 0
+    b <- unsafeCast <$> getObjectArrayElement args 1
+    a' <- reifA a
+    b' <- reifB b
+    upcast <$> reflC (f a' b')
+  where
+    reifA = reify :: J ty1 -> IO a
+    reifB = reify :: J ty2 -> IO b
+    reflC = reflect :: c -> IO (J ty3)
 
 clos2bs :: Typeable a => Closure a -> ByteString
 clos2bs = LBS.toStrict . encode
 
 bs2clos :: Typeable a => ByteString -> Closure a
 bs2clos = decode . LBS.fromStrict
+
+-- TODO No Static (Reify/Reflect (Closure (a -> b)) ty) instances yet.
+
+-- Needs UndecidableInstances
+instance ( JFun1 ty1 ty2 ~ Interp (Uncurry (Closure (a -> b)))
+         , Reflect a ty1
+         , Reify b ty2
+         , Typeable a
+         , Typeable b
+         , Typeable ty1
+         , Typeable ty2
+         ) =>
+         Reify (Closure (a -> b)) (JFun1 ty1 ty2) where
+  reify jobj = do
+      klass <- findClass "io/tweag/sparkle/function/HaskellFunction"
+      field <- getFieldID klass "clos" "[B"
+      jpayload <- getObjectField jobj field
+      payload <- reify (unsafeCast jpayload)
+      return (bs2clos payload)
+
+-- Needs UndecidableInstances
+instance ( JFun1 ty1 ty2 ~ Interp (Uncurry (Closure (a -> b)))
+         , Static (Reify a ty1)
+         , Static (Reflect b ty2)
+         , Typeable a
+         , Typeable b
+         , Typeable ty1
+         , Typeable ty2
+         ) =>
+         Reflect (Closure (a -> b)) (JFun1 ty1 ty2) where
+  reflect f = do
+      klass <- findClass "io/tweag/sparkle/function/HaskellFunction"
+      jpayload <- reflect (clos2bs wrap)
+      fmap unsafeCast $ newObject klass "([B)V" [JObject jpayload]
+    where
+      wrap :: Closure (JObjectArray -> IO JObject)
+      wrap = $(cstatic 'closFun1) `cap`
+             ($(cstatic 'pairDict) `cap` closureDict `cap` closureDict) `cap`
+             f
+
+instance ( JFun2 ty1 ty2 ty3 ~ Interp (Uncurry (Closure (a -> b -> c)))
+         , Reflect a ty1
+         , Reflect b ty2
+         , Reify   c ty3
+         , Typeable a
+         , Typeable b
+         , Typeable c
+         , Typeable ty1
+         , Typeable ty2
+         , Typeable ty3
+         ) =>
+         Reify (Closure (a -> b -> c)) (JFun2 ty1 ty2 ty3) where
+  reify jobj = do
+      klass <- findClass "io/tweag/sparkle/function/HaskellFunction2"
+      field <- getFieldID klass "clos" "[B"
+      jpayload <- getObjectField jobj field
+      payload <- reify (unsafeCast jpayload)
+      return (bs2clos payload)
+
+instance ( ty ~ Interp (Uncurry (Closure (a -> b -> c)))
+         , ty ~ ('Class "io.tweag.sparkle.function.HaskellFunction2" <> [ty1, ty2, ty3])
+         , Static (Reify a ty1)
+         , Static (Reify b ty2)
+         , Static (Reflect c ty3)
+         , Typeable a
+         , Typeable b
+         , Typeable c
+         , Typeable ty1
+         , Typeable ty2
+         , Typeable ty3
+         ) =>
+         Reflect (Closure (a -> b -> c)) ty where
+  reflect f = do
+      klass <- findClass "io/tweag/sparkle/function/HaskellFunction2"
+      jpayload <- reflect (clos2bs wrap)
+      fmap unsafeCast $ newObject klass "([B)V" [JObject jpayload]
+    where
+      wrap :: Closure (JObjectArray -> IO JObject)
+      wrap = $(cstatic 'closFun2) `cap`
+             ($(cstatic 'tripleDict) `cap` closureDict `cap` closureDict `cap` closureDict) `cap`
+             f
